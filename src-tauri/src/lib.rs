@@ -42,7 +42,7 @@ pub fn run() {
     let tray_ok = Arc::new(AtomicBool::new(false));
     let tray_ok_for_event = tray_ok.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
@@ -225,8 +225,32 @@ pub fn run() {
                 _ => {}
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        // macOS: clicking the dock icon when all windows are hidden should reopen the window
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows, ..
+        } = event
+        {
+            if !has_visible_windows {
+                show_main_window(app_handle);
+                log::debug!("[app] reopened window from dock click");
+            }
+        }
+    });
+}
+
+/// Restore the main window: unminimize if needed, then show and focus.
+fn show_main_window(handle: &impl tauri::Manager<tauri::Wry>) {
+    if let Some(w) = handle.get_webview_window("main") {
+        if w.is_minimized().unwrap_or(false) {
+            let _ = w.unminimize();
+        }
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
 
 /// Create system tray with Show/Quit menu. Left-click shows the window.
@@ -249,10 +273,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+                show_main_window(app);
             }
             "quit" => {
                 if let Some(ct) = app.try_state::<CancellationToken>() {
@@ -269,10 +290,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
-                if let Some(w) = tray.app_handle().get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+                show_main_window(tray.app_handle());
             }
         })
         .build(app)?;

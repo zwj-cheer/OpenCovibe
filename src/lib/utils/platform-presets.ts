@@ -38,7 +38,7 @@ export const PLATFORM_PRESETS: PlatformPreset[] = [
     id: "kimi-coding",
     name: "Kimi For Coding",
     base_url: "https://api.kimi.com/coding/",
-    auth_env_var: "ANTHROPIC_API_KEY",
+    auth_env_var: "ANTHROPIC_AUTH_TOKEN",
     description: "Kimi Code membership",
     key_placeholder: "your-kimi-coding-key",
     category: "provider",

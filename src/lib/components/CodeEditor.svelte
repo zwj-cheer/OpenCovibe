@@ -7,7 +7,7 @@
     highlightActiveLine,
     keymap,
   } from "@codemirror/view";
-  import { EditorState, Compartment } from "@codemirror/state";
+  import { EditorState, Compartment, type Extension } from "@codemirror/state";
   import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
   import {
     bracketMatching,
@@ -18,8 +18,9 @@
   } from "@codemirror/language";
   import { languages } from "@codemirror/language-data";
   import { oneDark } from "@codemirror/theme-one-dark";
-  import { dbg } from "$lib/utils/debug";
+  import { dbg, dbgWarn } from "$lib/utils/debug";
   import { fileName } from "$lib/utils/format";
+  import { resolveStaticLanguage, resolveByFirstLine } from "$lib/utils/codemirror-languages";
 
   let {
     content = $bindable(""),
@@ -42,85 +43,80 @@
   const themeCompartment = new Compartment();
   const langCompartment = new Compartment();
 
-  // Fallback: map filenames/patterns that @codemirror/language-data doesn't cover
-  // to a known language name in the languages array.
-  const filenameFallbacks: Record<string, string> = {
-    ".gitignore": "Shell",
-    ".dockerignore": "Shell",
-    ".npmignore": "Shell",
-    ".prettierignore": "Shell",
-    ".eslintignore": "Shell",
-    ".env": "Shell",
-    ".env.local": "Shell",
-    ".env.example": "Shell",
-    ".prettierrc": "JSON",
-    ".eslintrc": "JSON",
-    ".babelrc": "JSON",
-    ".swcrc": "JSON",
-    Makefile: "Shell",
-    GNUmakefile: "Shell",
-  };
-  // Extension-based fallback for types language-data misses
-  const extFallbacks: Record<string, string> = {
-    lock: "TOML", // Cargo.lock
-    env: "Shell",
-    conf: "Shell",
-    cfg: "Shell",
-    ini: "Shell",
-    properties: "Shell",
-    editorconfig: "Shell",
-  };
+  /** Race condition guard: only apply the latest language resolution. */
+  let langSeq = 0;
 
-  /** Resolve language support for a file path.
-   *  1. Try @codemirror/language-data (matchFilename — covers extensions + Dockerfile etc.)
-   *  2. Fall back to filename/extension mapping for dotfiles and config files.
-   *  Returns a promise — language modules are loaded on demand. */
-  async function loadLanguage(path: string) {
-    const filename = fileName(path);
+  /**
+   * Resolve language extensions for a file path.
+   *
+   * 1. Static mapping (sync) — covers ~20 common languages
+   * 2. Dynamic fallback via @codemirror/language-data (async, with try/catch)
+   * 3. Returns [] on failure (plain text, never throws)
+   */
+  async function resolveLanguage(path: string): Promise<Extension[]> {
+    const name = fileName(path);
 
-    // Primary: language-data auto-detection
-    let desc = LanguageDescription.matchFilename(languages, filename);
+    // 1. Static mapping (sync — no dynamic chunk loading)
+    const staticResult = resolveStaticLanguage(name);
+    if (staticResult) {
+      dbg("code-editor", "static-hit", { name });
+      return staticResult;
+    }
 
-    // Fallback: filename match
-    if (!desc) {
-      const fallbackLang = filenameFallbacks[filename];
-      if (fallbackLang) {
-        desc = languages.find((l) => l.name === fallbackLang) ?? null;
+    // 2. Dynamic fallback: language-data auto-detection
+    const desc = LanguageDescription.matchFilename(languages, name);
+    if (desc) {
+      try {
+        const support = await desc.load();
+        dbg("code-editor", "dynamic-hit", { name, lang: desc.name });
+        return [support];
+      } catch (e) {
+        dbgWarn("code-editor", "dynamic-failed", { name, lang: desc.name, error: e });
+        // Fall through to first-line detection below
       }
     }
 
-    // Fallback: extension match (for .lock, .env.*, .editorconfig, etc.)
-    if (!desc) {
-      const ext = filename.split(".").pop()?.toLowerCase() ?? "";
-      const fallbackLang = extFallbacks[ext];
-      if (fallbackLang) {
-        desc = languages.find((l) => l.name === fallbackLang) ?? null;
-      }
-    }
-
-    // Fallback: first-line detection (shebang, XML declaration, JSON braces)
-    if (!desc && content) {
+    // 3. First-line detection (shebang, XML declaration, JSON brace)
+    if (content) {
       const firstLine = content.trimStart().split("\n")[0] ?? "";
-      let guessLang: string | null = null;
-      if (/^#!.*\b(bash|sh|zsh)\b/.test(firstLine)) guessLang = "Shell";
-      else if (/^#!.*\b(python|python3)\b/.test(firstLine)) guessLang = "Python";
-      else if (/^#!.*\bnode\b/.test(firstLine)) guessLang = "JavaScript";
-      else if (/^<\?xml\b/.test(firstLine)) guessLang = "XML";
-      else if (/^<!DOCTYPE\s+html/i.test(firstLine) || /^<html/i.test(firstLine))
-        guessLang = "HTML";
-      else if (/^\s*[{[]/.test(firstLine)) guessLang = "JSON";
-      if (guessLang) {
-        desc = languages.find((l) => l.name === guessLang) ?? null;
+      const guess = resolveByFirstLine(firstLine);
+      if (guess) {
+        dbg("code-editor", "first-line-hit", { name, firstLine: firstLine.slice(0, 40) });
+        return guess;
       }
     }
 
-    if (!desc) {
-      dbg("code-editor", "no language match", { filename });
-      return [];
-    }
-    dbg("code-editor", "language matched", { filename, lang: desc.name });
-    const support = await desc.load();
-    return support;
+    dbg("code-editor", "plain-text-fallback", { name });
+    return [];
+  }
+
+  /** Check if syntax highlighting styles are actually applied after language loads. Run once. */
+  let styleCheckDone = false;
+  function verifySyntaxStyles(v: EditorView) {
+    if (styleCheckDone) return;
+    styleCheckDone = true;
+    // Give parser time to tokenize + style-mod to inject CSS
+    requestAnimationFrame(() => {
+      if (!v.dom.isConnected) return;
+      const baseColor = getComputedStyle(v.contentDOM).color;
+      // Sample up to 20 token spans — enough to detect missing styles without perf cost
+      const spans = v.contentDOM.querySelectorAll(".cm-line span");
+      const limit = Math.min(spans.length, 20);
+      let hasHighlight = false;
+      for (let i = 0; i < limit; i++) {
+        if (getComputedStyle(spans[i]).color !== baseColor) {
+          hasHighlight = true;
+          break;
+        }
+      }
+      if (limit > 0 && !hasHighlight) {
+        dbgWarn("code-editor", "style-injection-failed", {
+          baseColor,
+          sampledSpans: limit,
+          msg: "Language loaded but no token has distinct color — styles may not be injected",
+        });
+      }
+    });
   }
 
   function isDarkMode(): boolean {
@@ -170,11 +166,12 @@
 
     view = new EditorView({ state, parent: editorEl });
 
-    // Load language support async
-    loadLanguage(filePath).then((lang) => {
-      if (view) {
-        view.dispatch({ effects: langCompartment.reconfigure(lang) });
-      }
+    // Load language support
+    const seq = ++langSeq;
+    resolveLanguage(filePath).then((lang) => {
+      if (seq !== langSeq || !view) return; // stale — user already switched files
+      view.dispatch({ effects: langCompartment.reconfigure(lang) });
+      if (lang.length > 0) verifySyntaxStyles(view);
     });
 
     // Watch dark mode changes via MutationObserver on <html> class
@@ -212,10 +209,11 @@
   $effect(() => {
     if (!view) return;
     const _path = filePath; // track dependency
-    loadLanguage(_path).then((lang) => {
-      if (view) {
-        view.dispatch({ effects: langCompartment.reconfigure(lang) });
-      }
+    const seq = ++langSeq;
+    resolveLanguage(_path).then((lang) => {
+      if (seq !== langSeq || !view) return; // stale — user already switched files
+      view.dispatch({ effects: langCompartment.reconfigure(lang) });
+      if (lang.length > 0) verifySyntaxStyles(view);
     });
   });
 </script>

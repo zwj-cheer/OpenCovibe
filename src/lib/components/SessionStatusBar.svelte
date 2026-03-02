@@ -367,7 +367,7 @@
   <!-- Tier 1: Always visible (h-9) -->
   <div class="flex h-9 items-center justify-between px-3">
     <!-- Left: core info -->
-    <div class="flex items-center gap-1.5 min-w-0 flex-1">
+    <div class="flex items-center gap-1.5 min-w-0 flex-1 overflow-hidden">
       {#if onToggleSidebar}
         <button
           class="rounded p-1 -ml-1 mr-0.5 hover:bg-accent transition-colors"
@@ -390,7 +390,7 @@
       <!-- Pulse indicator + agent name (clickable for status) -->
       {#if onStatusClick}
         <button
-          class="inline-flex items-center gap-1.5 rounded px-1 -mx-1 hover:bg-accent/50 transition-colors"
+          class="inline-flex items-center gap-1.5 shrink-0 rounded px-1 -mx-1 hover:bg-accent/50 transition-colors"
           onclick={onStatusClick}
           title={t("toolActivity_tabInfo")}
         >
@@ -442,7 +442,7 @@
 
       {#if mode}
         <span
-          class="text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded {mode ===
+          class="shrink-0 text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded {mode ===
           'API'
             ? 'bg-violet-500/10 text-violet-400'
             : mode === 'Stream'
@@ -496,7 +496,7 @@
                 : "text-foreground/60"}
         <span class="text-foreground/30">&middot;</span>
         <span
-          class="flex items-center gap-1.5 {textColor}"
+          class="flex items-center gap-1.5 shrink-0 {textColor}"
           title={t("statusbar_contextTitle", {
             pct: String(pct),
             tokens: contextWindow ? fmtNumber(contextWindow) : "",
@@ -508,7 +508,7 @@
               style="width: {pct}%"
             ></span>
           </span>
-          <span>{t("statusbar_ctx", { pct: String(pct) })}</span>
+          <span class="hidden sm:inline">{t("statusbar_ctx", { pct: String(pct) })}</span>
           {#if compactVisible}
             <span
               class="text-[10px] text-blue-500 font-medium animate-pulse"
@@ -638,7 +638,7 @@
   {#if expanded}
     <div class="flex h-7 items-center justify-between px-3 border-t border-border/50">
       <!-- Left: details -->
-      <div class="flex items-center gap-1.5 min-w-0 flex-1">
+      <div class="flex items-center gap-1.5 min-w-0 flex-1 overflow-hidden">
         {#if cwdShort}
           <span class="truncate" title={cwd || run?.cwd || ""}>{cwdShort}</span>
         {/if}
@@ -684,18 +684,19 @@
         {/if}
 
         {#if cost > 0}
-          <span class="text-foreground/30">&middot;</span>
-          <span>{formatCost(cost)}</span>
+          <span class="text-foreground/30 shrink-0">&middot;</span>
+          <span class="shrink-0">{formatCost(cost)}</span>
         {/if}
 
         {#if inputTokens > 0 || outputTokens > 0}
-          <span class="text-foreground/30">&middot;</span>
+          <span class="text-foreground/30 shrink-0">&middot;</span>
           <span
+            class="shrink-0"
             title={`${t("statusbar_inputLabel")}: ${fmtNumber(inputTokens)} / ${t("statusbar_outputLabel")}: ${fmtNumber(outputTokens)}${cacheReadTokens ? `\n${t("statusbar_cacheReadLabel")}: ${fmtNumber(cacheReadTokens)}` : ""}${cacheWriteTokens ? `\n${t("statusbar_cacheWriteLabel")}: ${fmtNumber(cacheWriteTokens)}` : ""}`}
             >{formatTokens(inputTokens)} / {formatTokens(outputTokens)} {t("statusbar_tok")}</span
           >
           {#if cacheReadTokens > 0 || cacheWriteTokens > 0}
-            <span class="text-foreground/30 text-[10px]"
+            <span class="text-foreground/30 text-[10px] shrink-0"
               >{t("statusbar_cacheRW", {
                 read: formatTokens(cacheReadTokens),
                 write: formatTokens(cacheWriteTokens),
@@ -717,8 +718,8 @@
         {/if}
 
         {#if numTurns && numTurns > 0}
-          <span class="text-foreground/30">&middot;</span>
-          <span title={t("statusbar_turnsTitle")}
+          <span class="text-foreground/30 shrink-0">&middot;</span>
+          <span class="shrink-0" title={t("statusbar_turnsTitle")}
             >{t("statusbar_turns", { count: String(numTurns) })}</span
           >
         {/if}
@@ -728,8 +729,9 @@
             .filter((tu) => tu.durationMs && tu.durationMs > 0)
             .map((tu) => `T${tu.turnIndex}: ${formatDuration(tu.durationMs!)}`)
             .join(", ")}
-          <span class="text-foreground/30">&middot;</span>
+          <span class="text-foreground/30 shrink-0">&middot;</span>
           <span
+            class="shrink-0"
             title={t("statusbar_durationTitle") +
               (turnDetail ? `\n${t("statusbar_durationPerTurn")}: ${turnDetail}` : "")}
             >{formatDuration(durationMs)}</span
@@ -738,7 +740,7 @@
       </div>
 
       <!-- Right: secondary controls -->
-      <div class="flex items-center gap-1.5">
+      <div class="flex items-center gap-1.5 shrink-0">
         {#if permissionBadge}
           <span
             class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium {permissionBadge.cls}"
@@ -756,7 +758,7 @@
 
         {#if verbose}
           <span
-            class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-sky-500/15 text-sky-400"
+            class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-sky-500/15 text-sky-400 hidden sm:inline"
             title={t("statusbar_verboseTitle")}>{t("statusbar_verbose")}</span
           >
         {/if}
@@ -786,7 +788,7 @@
 
         {#if cliVersion}
           <button
-            class="text-foreground/30 hover:text-foreground/60 transition-colors"
+            class="text-foreground/30 hover:text-foreground/60 transition-colors hidden sm:inline"
             title={t("statusbar_cliVersionTitle", { version: cliVersion ?? "" })}
             onclick={() => goto("/release-notes")}>v{cliVersion}</button
           >

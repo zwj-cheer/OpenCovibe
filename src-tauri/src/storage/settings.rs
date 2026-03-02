@@ -147,6 +147,7 @@ fn migrate_platform_credentials(settings: &mut AllSettings) -> bool {
         ("minimax", "ANTHROPIC_API_KEY"),
         ("minimax-cn", "ANTHROPIC_API_KEY"),
         ("mimo", "ANTHROPIC_API_KEY"),
+        ("kimi-coding", "ANTHROPIC_AUTH_TOKEN"),
     ];
     let mut changed = false;
 
