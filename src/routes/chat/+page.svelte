@@ -32,16 +32,20 @@
   import { IS_WEBKIT } from "$lib/utils/platform";
   import {
     detectBatchGroups,
+    detectToolBursts,
     isPlanFilePath,
     planFileName,
     extractPlanContent,
   } from "$lib/utils/tool-rendering";
+  import type { ToolBurst } from "$lib/utils/tool-rendering";
 
   const EMPTY_BATCH_MAP = new Map();
+  const EMPTY_BURST_MAP = new Map() as Map<number, ToolBurst>;
   import XTerminal from "$lib/components/XTerminal.svelte";
   import ChatMessage from "$lib/components/ChatMessage.svelte";
   import InlineToolCard from "$lib/components/InlineToolCard.svelte";
   import BatchProgressBar from "$lib/components/BatchProgressBar.svelte";
+  import ToolBurstHeader from "$lib/components/ToolBurstHeader.svelte";
   import SessionStatusBar from "$lib/components/SessionStatusBar.svelte";
   import McpStatusPanel from "$lib/components/McpStatusPanel.svelte";
   import PromptInput from "$lib/components/PromptInput.svelte";
@@ -68,6 +72,9 @@
   import { mergeWithVirtual, buildHelpText } from "$lib/utils/slash-commands";
   import { executeAddDir } from "$lib/utils/add-dir";
   import { buildDoctorReport } from "$lib/utils/doctor";
+  import type { RewindCandidate, RewindMarker } from "$lib/utils/rewind";
+  import { truncate } from "$lib/utils/format";
+  import RewindModal from "$lib/components/RewindModal.svelte";
 
   // ── Helpers ──
 
@@ -139,6 +146,48 @@
   // ── Task notification banner ──
   let notificationVisible = $state(false);
   let latestNotification = $state<{ task_id: string; status: string } | null>(null);
+
+  // ── Rewind modal ──
+  let rewindModalOpen = $state(false);
+  let rewindDirectTarget = $state<RewindCandidate | null>(null);
+  let rewindMarkers = $state<RewindMarker[]>([]);
+
+  // Clear direct target on modal close
+  $effect(() => {
+    if (!rewindModalOpen) rewindDirectTarget = null;
+  });
+
+  // Clear markers on run switch (explicit prev-value check)
+  let prevRewindRunId = "";
+  $effect(() => {
+    const id = store.run?.id ?? "";
+    if (id !== prevRewindRunId) {
+      prevRewindRunId = id;
+      rewindMarkers = [];
+    }
+  });
+
+  let rewindCandidates = $derived(
+    store.timeline
+      .map((e, i) => ({ entry: e, idx: i }))
+      .filter(
+        (
+          x,
+        ): x is {
+          entry: Extract<TimelineEntry, { kind: "user" }> & { cliUuid: string };
+          idx: number;
+        } => x.entry.kind === "user" && !!x.entry.cliUuid,
+      )
+      .reverse()
+      .map(
+        ({ entry, idx }): RewindCandidate => ({
+          cliUuid: entry.cliUuid,
+          content: entry.content,
+          ts: entry.ts,
+          timelineIndex: idx,
+        }),
+      ),
+  );
 
   // ── Shortcut help panel ──
   let shortcutHelpOpen = $state(false);
@@ -279,6 +328,71 @@
       _lastBatchSig = sig;
       if (size > 0) dbg("chat", "batchGroups", { groupCount: size, totalAgents: agents });
     }
+  });
+
+  // ── Tool burst groups (excludes Task — handled by BatchProgressBar) ──
+  let toolBursts = $derived(toolFilter ? EMPTY_BURST_MAP : detectToolBursts(visibleTimeline));
+
+  // Layer 1: Auto-collapse — completed + no interaction needed → collapsed (derived, pure)
+  let autoCollapsed = $derived.by(() => {
+    const keys = new Set<string>();
+    for (const [, burst] of toolBursts) {
+      const needsInteraction = burst.tools.some(
+        (t) => t.status === "permission_prompt" || t.status === "ask_pending",
+      );
+      if (burst.stats.running === 0 && burst.stats.total > 0 && !needsInteraction) {
+        keys.add(burst.key);
+      }
+    }
+    return keys;
+  });
+
+  // Layer 2: Manual overrides — user explicitly toggled (state, survives re-renders)
+  // true = user forced expand, false = user forced collapse, absent = follow auto
+  let manualOverrides = $state(new Map<string, boolean>());
+
+  function toggleBurst(key: string) {
+    const next = new Map(manualOverrides);
+    const currentlyCollapsed = effectiveCollapsed.has(key);
+    next.set(key, currentlyCollapsed); // if collapsed → override to expanded (true), vice versa
+    manualOverrides = next;
+  }
+
+  // Layer 3: Effective collapsed set — merge auto + manual (derived)
+  // Priority: needsInteraction (force expand) > manual > auto
+  let effectiveCollapsed = $derived.by(() => {
+    const result = new Set<string>();
+    for (const [, burst] of toolBursts) {
+      // Highest priority: interaction needed → always expand, ignore everything else
+      const needsInteraction = burst.tools.some(
+        (t) => t.status === "permission_prompt" || t.status === "ask_pending",
+      );
+      if (needsInteraction) continue;
+
+      const manual = manualOverrides.get(burst.key);
+      if (manual === true) continue; // user forced expand → skip
+      if (manual === false) {
+        // user forced collapse → add
+        result.add(burst.key);
+        continue;
+      }
+      if (autoCollapsed.has(burst.key)) {
+        // no override → follow auto
+        result.add(burst.key);
+      }
+    }
+    return result;
+  });
+
+  // Indices hidden by collapsed bursts (for skipping render)
+  let burstHiddenIndices = $derived.by(() => {
+    const hidden = new Set<number>();
+    for (const [, burst] of toolBursts) {
+      if (effectiveCollapsed.has(burst.key)) {
+        for (let j = burst.startIndex; j <= burst.endIndex; j++) hidden.add(j);
+      }
+    }
+    return hidden;
   });
 
   // ── Auto-context tracking ──
@@ -445,6 +559,8 @@
   let isExpandingTimeline = $derived(false);
 
   let welcomeVisible = $derived(store.timeline.length === 0 && !store.streamingText && !store.run);
+
+  let inputBlockedByPermission = $derived(store.hasPendingPermission);
 
   /** Skill info for SkillSelector: merge preloaded details with session skill names. */
   let skillItems = $derived.by(() => {
@@ -1222,6 +1338,30 @@
     }
   }
 
+  // ── Permission pending auto-scroll ──
+  let prevPermissionRunId = "";
+  let prevHadPermission = false;
+
+  $effect(() => {
+    const runId = store.run?.id ?? "";
+    const has = store.hasPendingPermission;
+
+    if (runId !== prevPermissionRunId) {
+      prevPermissionRunId = runId;
+      prevHadPermission = false;
+    }
+
+    if (has && !prevHadPermission) {
+      if (!chatAreaRef) return;
+      requestAnimationFrame(() => {
+        scrollChatToBottom();
+      });
+      dbg("chat", "permission pending -> autoscroll", { runId });
+    }
+
+    prevHadPermission = has;
+  });
+
   // ── Send message ──
 
   async function sendMessage(text: string, attachments: Attachment[]) {
@@ -1552,6 +1692,24 @@
     }
   });
 
+  async function handleFastModeSwitch(mode: "on" | "off") {
+    const enabling = mode === "on";
+    const current = store.fastModeState === "on";
+    if (enabling === current) {
+      appendCommandOutput(t(enabling ? "fast_alreadyOn" : "fast_alreadyOff"));
+      return;
+    }
+    try {
+      await api.updateCliConfig({ fastMode: enabling });
+      store.fastModeState = enabling ? "on" : "";
+      dbg("chat", "fastMode set", { mode });
+      showChatToast(t(enabling ? "toast_fastModeOn" : "toast_fastModeOff"));
+      appendCommandOutput(t(enabling ? "fast_enabled" : "fast_disabled"));
+    } catch (e) {
+      dbgWarn("chat", "fastMode set failed:", e);
+    }
+  }
+
   async function handleVirtualCommand(action: string, args: string) {
     dbg("chat", "virtualCommand", { action, args });
     if (action === "copy-last") {
@@ -1842,6 +2000,16 @@
           appendCommandOutput(`${t("slashTasks_ambiguous", { id: args })}\n${list}`);
         }
       }
+    } else if (action === "toggle-fast") {
+      const arg = args.toLowerCase();
+      if (arg === "on" || arg === "off") {
+        await handleFastModeSwitch(arg);
+      } else if (arg === "") {
+        const enabling = store.fastModeState !== "on";
+        await handleFastModeSwitch(enabling ? "on" : "off");
+      } else {
+        appendCommandOutput(t("fast_usage"));
+      }
     } else if (action === "add-dir") {
       try {
         await executeAddDir(
@@ -1866,6 +2034,16 @@
             error: err instanceof Error ? err.message : String(err),
           }),
         );
+      }
+    } else if (action === "rewind") {
+      if (!store.run) {
+        appendCommandOutput(t("rewind_noSession"));
+      } else if (!store.sessionAlive) {
+        appendCommandOutput(t("rewind_sessionEnded"));
+      } else if (store.isRunning) {
+        appendCommandOutput(t("rewind_sessionBusy"));
+      } else {
+        handleRewind();
       }
     }
   }
@@ -2071,16 +2249,22 @@
     await store.answerToolQuestion(toolUseId, answer);
   }
 
-  async function handleRewind() {
-    if (!store.run || !store.sessionAlive) return;
-    try {
-      await api.rewindFiles(store.run.id);
-      dbg("chat", "rewind triggered");
-      showChatToast(t("toast_rewindSuccess"));
-    } catch (e) {
-      dbgWarn("chat", "rewind failed:", e);
-      store.error = String(e);
-    }
+  function handleRewind() {
+    if (!store.run || !store.sessionAlive || store.isRunning) return;
+    rewindModalOpen = true;
+  }
+
+  function handleRewindToMessage(entry: { cliUuid: string; content: string; ts: string }) {
+    if (!store.run || !store.sessionAlive || store.isRunning) return;
+    rewindDirectTarget = {
+      cliUuid: entry.cliUuid,
+      content: entry.content,
+      ts: entry.ts,
+      timelineIndex: store.timeline.findIndex(
+        (e) => e.kind === "user" && e.cliUuid === entry.cliUuid,
+      ),
+    };
+    rewindModalOpen = true;
   }
 
   async function handleToolApprove(toolName: string) {
@@ -2707,124 +2891,225 @@
                 </div>
               {/if}
               {#each visibleTimeline as entry, i (entry.id)}
-                <div class:cv-auto={!IS_WEBKIT}>
-                  {#if batchGroups.has(i)}
-                    {@const batch = batchGroups.get(i)}
-                    {#if batch}
-                      <div class="w-full py-1">
+                {#if !(burstHiddenIndices.has(i) && !toolBursts.has(i))}
+                  <div class:cv-auto={!IS_WEBKIT} class="group/msg">
+                    {#if batchGroups.has(i)}
+                      {@const batch = batchGroups.get(i)}
+                      {#if batch}
+                        <div class="w-full py-1">
+                          <div class="mx-auto max-w-5xl px-8 pl-11">
+                            <BatchProgressBar tools={batch} />
+                          </div>
+                        </div>
+                      {/if}
+                    {/if}
+                    {#if toolBursts.has(i)}
+                      {@const burst = toolBursts.get(i)}
+                      {#if burst}
+                        <div class="w-full py-1">
+                          <div class="mx-auto max-w-5xl px-8 pl-11">
+                            <ToolBurstHeader
+                              {burst}
+                              collapsed={effectiveCollapsed.has(burst.key)}
+                              onToggle={() => toggleBurst(burst.key)}
+                            />
+                          </div>
+                        </div>
+                      {/if}
+                    {/if}
+                    {#if usageAnnotations.has(i)}
+                      {@const tu = usageAnnotations.get(i)}
+                      {#if tu}
+                        <div class="w-full py-1.5">
+                          <div class="mx-auto max-w-5xl px-8">
+                            <div class="flex items-center gap-3">
+                              <div class="h-px flex-1 bg-border/40"></div>
+                              <span class="text-[10px] tabular-nums text-muted-foreground/50">
+                                {formatTokens(tu.inputTokens)}
+                                {t("chat_usageIn")} · {formatTokens(tu.outputTokens)}
+                                {t("chat_usageOut")}
+                                {#if tu.cacheReadTokens > 0 || tu.cacheWriteTokens > 0}
+                                  · {t("chat_usageCache", {
+                                    read: formatTokens(tu.cacheReadTokens),
+                                    write: formatTokens(tu.cacheWriteTokens),
+                                  })}
+                                {/if}
+                              </span>
+                              <div class="h-px flex-1 bg-border/40"></div>
+                            </div>
+                          </div>
+                        </div>
+                      {/if}
+                    {/if}
+                    {#if entry.kind === "user"}
+                      <ChatMessage
+                        message={{
+                          id: entry.id,
+                          role: "user",
+                          content: entry.content,
+                          timestamp: entry.ts,
+                        }}
+                        attachments={entry.attachments}
+                      />
+                      {#if entry.cliUuid && store.sessionAlive && !store.isRunning}
+                        <div class="relative mx-auto max-w-5xl px-8 pl-11 h-0">
+                          <button
+                            type="button"
+                            class="absolute top-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]
+                              opacity-0 pointer-events-none transition-all
+                              group-hover/msg:opacity-100 group-hover/msg:pointer-events-auto
+                              text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/50"
+                            onclick={() => handleRewindToMessage(entry)}
+                            title={t("rewind_toHere")}
+                          >
+                            <svg
+                              class="h-3 w-3"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                            >
+                              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                              <path d="M3 3v5h5" />
+                            </svg>
+                            {t("rewind_toHere")}
+                          </button>
+                        </div>
+                      {/if}
+                    {:else if entry.kind === "assistant"}
+                      <ChatMessage
+                        message={{
+                          id: entry.id,
+                          role: "assistant",
+                          content: entry.content,
+                          timestamp: entry.ts,
+                        }}
+                      />
+                    {:else if entry.kind === "tool"}
+                      {#if !burstHiddenIndices.has(i)}
+                        <div class="w-full py-1" id="tool-{entry.tool.tool_use_id}">
+                          <div class="mx-auto max-w-5xl px-8 pl-11">
+                            <InlineToolCard
+                              tool={entry.tool}
+                              subTimeline={entry.subTimeline}
+                              runId={store.run?.id ?? ""}
+                              {fetchToolResult}
+                              onAnswer={entry.tool.tool_name === "AskUserQuestion" &&
+                              (entry.tool.status === "running" ||
+                                entry.tool.status === "ask_pending")
+                                ? (answer) => handleToolAnswer(entry.tool.tool_use_id, answer)
+                                : undefined}
+                              onApprove={handleToolApprove}
+                              onPermissionRespond={handlePermissionRespond}
+                              onExitPlanClearContext={handleExitPlanClearContext}
+                              taskNotifications={store.taskNotifications}
+                              planContent={entry.tool.tool_name === "ExitPlanMode" &&
+                              (entry.tool.status === "permission_prompt" ||
+                                entry.tool.status === "success")
+                                ? getPlanContentForExitPlan(entry.id)
+                                : undefined}
+                              latestPlanTool={entry.kind === "tool" &&
+                                entry.tool.tool_use_id === latestPlanToolId}
+                            />
+                          </div>
+                        </div>
+                      {/if}
+                    {:else if entry.kind === "command_output"}
+                      <div class="w-full py-2">
                         <div class="mx-auto max-w-5xl px-8 pl-11">
-                          <BatchProgressBar tools={batch} />
+                          <div
+                            class="command-output rounded-lg border border-border/40 bg-[#1a1b26] px-4 py-3 text-sm overflow-x-auto"
+                          >
+                            {#if entry.content.includes("## Context Usage")}
+                              <ContextUsageGrid text={entry.content} />
+                            {:else if entry.content.includes("Total cost:") && entry.content.includes("Total duration")}
+                              <CostSummaryView text={entry.content} />
+                            {:else if entry.content
+                              .trimStart()
+                              .startsWith("Version ") && entry.content.includes("•")}
+                              <ReleaseNotesCard text={entry.content} />
+                            {:else if hasAnsiCodes(entry.content)}
+                              <pre
+                                class="whitespace-pre font-mono text-xs leading-relaxed text-[#c0caf5] m-0">{@html ansiToHtml(
+                                  entry.content,
+                                )}</pre>
+                            {:else}
+                              <MarkdownContent text={entry.content} />
+                            {/if}
+                          </div>
                         </div>
                       </div>
-                    {/if}
-                  {/if}
-                  {#if usageAnnotations.has(i)}
-                    {@const tu = usageAnnotations.get(i)}
-                    {#if tu}
-                      <div class="w-full py-1.5">
+                    {:else if entry.kind === "separator"}
+                      <div class="w-full py-3">
                         <div class="mx-auto max-w-5xl px-8">
                           <div class="flex items-center gap-3">
-                            <div class="h-px flex-1 bg-border/40"></div>
-                            <span class="text-[10px] tabular-nums text-muted-foreground/50">
-                              {formatTokens(tu.inputTokens)}
-                              {t("chat_usageIn")} · {formatTokens(tu.outputTokens)}
-                              {t("chat_usageOut")}
-                              {#if tu.cacheReadTokens > 0 || tu.cacheWriteTokens > 0}
-                                · {t("chat_usageCache", {
-                                  read: formatTokens(tu.cacheReadTokens),
-                                  write: formatTokens(tu.cacheWriteTokens),
-                                })}
-                              {/if}
+                            <div class="h-px flex-1 bg-amber-500/20"></div>
+                            <span class="text-xs text-amber-500/70 font-medium whitespace-nowrap">
+                              {entry.content}
                             </span>
-                            <div class="h-px flex-1 bg-border/40"></div>
+                            <div class="h-px flex-1 bg-amber-500/20"></div>
                           </div>
                         </div>
                       </div>
                     {/if}
-                  {/if}
-                  {#if entry.kind === "user"}
-                    <ChatMessage
-                      message={{
-                        id: entry.id,
-                        role: "user",
-                        content: entry.content,
-                        timestamp: entry.ts,
-                      }}
-                      attachments={entry.attachments}
-                    />
-                  {:else if entry.kind === "assistant"}
-                    <ChatMessage
-                      message={{
-                        id: entry.id,
-                        role: "assistant",
-                        content: entry.content,
-                        timestamp: entry.ts,
-                      }}
-                    />
-                  {:else if entry.kind === "tool"}
-                    <div class="w-full py-1" id="tool-{entry.tool.tool_use_id}">
-                      <div class="mx-auto max-w-5xl px-8 pl-11">
-                        <InlineToolCard
-                          tool={entry.tool}
-                          subTimeline={entry.subTimeline}
-                          runId={store.run?.id ?? ""}
-                          {fetchToolResult}
-                          onAnswer={entry.tool.tool_name === "AskUserQuestion" &&
-                          (entry.tool.status === "running" || entry.tool.status === "ask_pending")
-                            ? (answer) => handleToolAnswer(entry.tool.tool_use_id, answer)
-                            : undefined}
-                          onApprove={handleToolApprove}
-                          onPermissionRespond={handlePermissionRespond}
-                          onExitPlanClearContext={handleExitPlanClearContext}
-                          taskNotifications={store.taskNotifications}
-                          planContent={entry.tool.tool_name === "ExitPlanMode" &&
-                          (entry.tool.status === "permission_prompt" ||
-                            entry.tool.status === "success")
-                            ? getPlanContentForExitPlan(entry.id)
-                            : undefined}
-                          latestPlanTool={entry.kind === "tool" &&
-                            entry.tool.tool_use_id === latestPlanToolId}
-                        />
-                      </div>
-                    </div>
-                  {:else if entry.kind === "command_output"}
-                    <div class="w-full py-2">
-                      <div class="mx-auto max-w-5xl px-8 pl-11">
-                        <div
-                          class="command-output rounded-lg border border-border/40 bg-[#1a1b26] px-4 py-3 text-sm overflow-x-auto"
+                  </div>
+                {/if}
+              {/each}
+
+              <!-- Rewind markers (independent array, not in store.timeline) -->
+              {#each rewindMarkers as marker, mi (marker.id)}
+                <div
+                  class="w-full py-3"
+                  id={mi === rewindMarkers.length - 1 ? "rewind-marker-latest" : undefined}
+                >
+                  <div class="mx-auto max-w-5xl px-8">
+                    <div class="flex items-center gap-3">
+                      <div class="h-px flex-1 bg-violet-500/20"></div>
+                      <div class="flex items-center gap-2 text-xs text-violet-500/80 font-medium">
+                        <svg
+                          class="h-3.5 w-3.5"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
                         >
-                          {#if entry.content.includes("## Context Usage")}
-                            <ContextUsageGrid text={entry.content} />
-                          {:else if entry.content.includes("Total cost:") && entry.content.includes("Total duration")}
-                            <CostSummaryView text={entry.content} />
-                          {:else if entry.content
-                            .trimStart()
-                            .startsWith("Version ") && entry.content.includes("•")}
-                            <ReleaseNotesCard text={entry.content} />
-                          {:else if hasAnsiCodes(entry.content)}
-                            <pre
-                              class="whitespace-pre font-mono text-xs leading-relaxed text-[#c0caf5] m-0">{@html ansiToHtml(
-                                entry.content,
-                              )}</pre>
-                          {:else}
-                            <MarkdownContent text={entry.content} />
-                          {/if}
-                        </div>
+                          <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                          <path d="M3 3v5h5" />
+                        </svg>
+                        <span
+                          >{t("rewind_separatorLabel", {
+                            count: String(marker.filesReverted.length),
+                          })}</span
+                        >
                       </div>
+                      <div class="h-px flex-1 bg-violet-500/20"></div>
                     </div>
-                  {:else if entry.kind === "separator"}
-                    <div class="w-full py-3">
-                      <div class="mx-auto max-w-5xl px-8">
-                        <div class="flex items-center gap-3">
-                          <div class="h-px flex-1 bg-amber-500/20"></div>
-                          <span class="text-xs text-amber-500/70 font-medium whitespace-nowrap">
-                            {entry.content}
-                          </span>
-                          <div class="h-px flex-1 bg-amber-500/20"></div>
+                    <div class="mt-1 ml-8 text-[11px] text-muted-foreground/60 truncate">
+                      &ldquo;{marker.targetContent}&rdquo;
+                    </div>
+                    {#if marker.filesReverted.length > 0}
+                      <details class="mt-1 ml-8">
+                        <summary
+                          class="cursor-pointer text-[10px] text-violet-500/50 hover:text-violet-500/80"
+                        >
+                          {t("rewind_separatorFiles", {
+                            count: String(marker.filesReverted.length),
+                          })}
+                        </summary>
+                        <div class="mt-1 rounded bg-muted/30 px-2 py-1">
+                          {#each marker.filesReverted as file}
+                            <div class="truncate font-mono text-[10px] text-muted-foreground">
+                              {file}
+                            </div>
+                          {/each}
                         </div>
-                      </div>
-                    </div>
-                  {/if}
+                      </details>
+                    {/if}
+                  </div>
                 </div>
               {/each}
 
@@ -3253,6 +3538,8 @@
         bind:this={promptRef}
         agent={store.agent}
         running={store.isActivelyRunning}
+        disabled={inputBlockedByPermission}
+        pendingPermission={inputBlockedByPermission}
         hasRun={!!store.run}
         sessionAlive={store.sessionAlive}
         canResume={!store.sessionAlive && !!store.run?.session_id && store.useStreamSession}
@@ -3274,6 +3561,8 @@
         onModelSwitch={handleModelChange}
         onPermissionModeChange={store.agent === "claude" ? handlePermissionModeChange : undefined}
         onVirtualCommand={handleVirtualCommand}
+        fastModeState={store.fastModeState}
+        onFastModeSwitch={handleFastModeSwitch}
         onPlatformChange={handlePlatformChange}
         {authOverview}
         authSourceLabel={store.authSourceLabel}
@@ -3326,6 +3615,36 @@
       }}
     />
   {/if}
+
+  <RewindModal
+    bind:open={rewindModalOpen}
+    runId={store.run?.id ?? ""}
+    candidates={rewindCandidates}
+    initialCandidate={rewindDirectTarget}
+    onSuccess={(info) => {
+      // Run-id debounce: discard if run changed while modal was open
+      if (info.runId !== store.run?.id) return;
+      rewindMarkers = [
+        ...rewindMarkers,
+        {
+          id: crypto.randomUUID(),
+          ts: new Date().toISOString(),
+          targetContent: truncate(info.targetContent, 80),
+          filesReverted: info.filesReverted,
+        },
+      ];
+      if (info.degraded) {
+        showChatToast(t("rewind_degradedToFull"));
+      } else {
+        showChatToast(t("toast_rewindSuccess"));
+      }
+      tick().then(() => {
+        document
+          .getElementById("rewind-marker-latest")
+          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    }}
+  />
 
   <ShortcutHelpPanel bind:open={shortcutHelpOpen} />
 
