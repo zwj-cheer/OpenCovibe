@@ -92,23 +92,5 @@ execSync(`git tag ${tag}`, { stdio: "inherit" });
 console.log(`\n  ✓ Committed and tagged ${tag}`);
 console.log(`\n  Next steps:`);
 console.log(`    git push && git push origin ${tag}`);
-console.log(`\n  Build:`);
-console.log(
-  `    cargo tauri build --target universal-apple-darwin                    # macOS dmg`,
-);
-console.log(
-  `    cargo tauri build --target x86_64-pc-windows-msvc                   # Windows exe (x64)`,
-);
-console.log(`\n  Release:`);
-console.log(
-  `    gh release create ${tag} \\`,
-);
-console.log(
-  `      src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg \\`,
-);
-console.log(
-  `      src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe \\`,
-);
-console.log(
-  `      --title "${tag}"`,
-);
+console.log(`\n  CI will automatically build macOS dmg + Windows exe and upload to the release.`);
+console.log(`  Monitor: https://github.com/AnyiWang/OpenCovibe/actions`);
