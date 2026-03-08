@@ -10,8 +10,7 @@
     searchPrompts,
     listMemoryFiles,
   } from "$lib/api";
-  import RunListItem from "$lib/components/RunListItem.svelte";
-  import ProjectSelector from "$lib/components/ProjectSelector.svelte";
+  import ProjectFolderItem from "$lib/components/ProjectFolderItem.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import SetupWizard from "$lib/components/SetupWizard.svelte";
   import AboutModal from "$lib/components/AboutModal.svelte";
@@ -28,9 +27,15 @@
   } from "$lib/types";
   import { cwdDisplayLabel, truncate, relativeTime } from "$lib/utils/format";
   import { filterVisibleCandidates } from "$lib/utils/memory-helpers";
+  import {
+    buildProjectFolders,
+    autoExpandForRun,
+    expandForProjectChange,
+    normalizeCwd,
+  } from "$lib/utils/sidebar-groups";
   import { page } from "$app/stores";
   import { goto, afterNavigate } from "$app/navigation";
-  import { onMount, setContext } from "svelte";
+  import { onMount, setContext, untrack } from "svelte";
   import { dbg, dbgWarn } from "$lib/utils/debug";
   import { PLATFORM_PRESETS } from "$lib/utils/platform-presets";
   import type { PlatformCredential } from "$lib/types";
@@ -98,6 +103,10 @@
   let panelTab = $state<"chats" | "teams">("chats");
   let runSearchQuery = $state("");
 
+  // ── Folder tree state ──
+  let expandedProjects = $state<Set<string>>(new Set());
+  let runsLoadSucceededOnce = $state(false);
+
   // ── Deep search (backend full-text) ──
   let searchResults = $state<PromptSearchResult[]>([]);
   let searching = $state(false);
@@ -120,6 +129,7 @@
   let treeLoading = $state(false);
   let explorerSelectedFile = $state("");
   let explorerTab = $state<"files" | "git">("files");
+  let explorerProjectOpen = $state(false);
 
   // ── Git state (shown in sidebar Git tab when on /explorer) ──
   let gitSummary = $state<GitSummary | null>(null);
@@ -146,21 +156,25 @@
     }));
   }
 
+  let _treeSeq = 0;
   async function loadRootTree() {
     if (!projectCwd) {
       fileTree = [];
       return;
     }
+    const seq = ++_treeSeq;
     treeLoading = true;
     try {
       const listing = await listDirectory(projectCwd, true);
+      if (seq !== _treeSeq) return; // stale response, discard
       fileTree = entriesToNodes(listing.entries, projectCwd, 0);
       dbg("layout", "file tree loaded", { count: fileTree.length });
     } catch (e) {
+      if (seq !== _treeSeq) return;
       dbgWarn("layout", "file tree load error", e);
       fileTree = [];
     } finally {
-      treeLoading = false;
+      if (seq === _treeSeq) treeLoading = false;
     }
   }
 
@@ -186,22 +200,27 @@
     window.dispatchEvent(new CustomEvent("ocv:explorer-file", { detail: { path: node.fullPath } }));
   }
 
+  let _gitSeq = 0;
   async function loadGitSummary() {
     if (!projectCwd) {
       gitSummary = null;
       return;
     }
+    const seq = ++_gitSeq;
     gitLoading = true;
     try {
-      gitSummary = await getGitSummary(projectCwd);
+      const result = await getGitSummary(projectCwd);
+      if (seq !== _gitSeq) return; // stale response, discard
+      gitSummary = result;
       dbg("layout", "git summary loaded", {
-        branch: gitSummary.branch,
-        files: gitSummary.total_files,
+        branch: result.branch,
+        files: result.total_files,
       });
     } catch {
+      if (seq !== _gitSeq) return;
       gitSummary = null;
     } finally {
-      gitLoading = false;
+      if (seq === _gitSeq) gitLoading = false;
     }
   }
 
@@ -213,25 +232,22 @@
   // ── Memory sidebar state (shown when on /memory) ──
   let memoryCandidates = $state<MemoryFileCandidate[]>([]);
   let memorySelectedFile = $state("");
+  let memoryLoading = $state(false);
   let memoryScopeExpanded = $state<Record<string, boolean>>({
-    project: true,
     global: false,
-    memory: false,
-  });
-  let memoryShowCreate = $state<Record<string, boolean>>({
-    project: false,
-    global: false,
-    memory: false,
   });
 
   let memoryScopeProject = $derived(memoryCandidates.filter((c) => c.scope === "project"));
   let memoryScopeGlobal = $derived(memoryCandidates.filter((c) => c.scope === "global"));
   let memoryScopeMemory = $derived(memoryCandidates.filter((c) => c.scope === "memory"));
+  // Merged project + auto memory for flat folder view
+  let memoryScopeFolder = $derived([...memoryScopeProject, ...memoryScopeMemory]);
 
   let memoryCandidateSeq = 0;
 
-  async function loadMemoryCandidates() {
+  async function loadMemoryCandidates(opts?: { soft?: boolean }) {
     const seq = ++memoryCandidateSeq;
+    if (!opts?.soft) memoryLoading = true;
     try {
       const result = await listMemoryFiles(projectCwd || undefined);
       if (seq !== memoryCandidateSeq) return; // stale — discard
@@ -242,8 +258,14 @@
       });
     } catch (e) {
       if (seq !== memoryCandidateSeq) return;
-      dbgWarn("layout", "memory candidates load error", e);
-      memoryCandidates = [];
+      if (opts?.soft) {
+        dbgWarn("layout", "soft memory refresh failed, keeping old data", e);
+      } else {
+        dbgWarn("layout", "memory candidates load error", e);
+        memoryCandidates = [];
+      }
+    } finally {
+      if (seq === memoryCandidateSeq) memoryLoading = false;
     }
   }
 
@@ -263,9 +285,20 @@
   $effect(() => {
     const _path = currentPath;
     const _cwd = projectCwd;
-    if (_path?.startsWith("/explorer") && _cwd) {
-      loadRootTree();
-      loadGitSummary();
+    if (_path?.startsWith("/explorer")) {
+      if (_cwd) {
+        loadRootTree();
+        loadGitSummary();
+      } else {
+        // Increment seq to invalidate any in-flight requests
+        ++_treeSeq;
+        ++_gitSeq;
+        // Clear state
+        fileTree = [];
+        gitSummary = null;
+        gitLoading = false;
+        treeLoading = false;
+      }
     }
   });
 
@@ -276,10 +309,11 @@
     const _cwd = projectCwd;
     if (_path?.startsWith("/memory")) {
       const cwdChanged = _cwd !== _prevMemoryCwd;
-      const routeEntered = _prevMemoryCwd === undefined;
       _prevMemoryCwd = _cwd;
-      if (cwdChanged || routeEntered) {
-        memoryShowCreate = { project: false, global: false, memory: false };
+      if (cwdChanged) {
+        // Only clear project scope, keep Global/Memory to avoid visual jitter
+        // Use untrack to read memoryCandidates without adding it as a dependency
+        memoryCandidates = untrack(() => memoryCandidates).filter((c) => c.scope !== "project");
       }
       loadMemoryCandidates();
     }
@@ -299,6 +333,7 @@
   async function loadRuns() {
     try {
       runs = await listRuns();
+      runsLoadSucceededOnce = true;
     } catch {
       // Silently fail
     }
@@ -357,9 +392,12 @@
   async function loadSettings() {
     try {
       settings = await getUserSettings();
-      if (settings.working_directory) {
-        localStorage.setItem("ocv:settings-cwd", settings.working_directory);
-        if (!projectCwd) projectCwd = settings.working_directory;
+      const normalizedWd = normalizeCwd(settings.working_directory);
+      if (normalizedWd) {
+        localStorage.setItem("ocv:settings-cwd", normalizedWd);
+        if (!projectCwd) projectCwd = normalizedWd;
+      } else {
+        localStorage.removeItem("ocv:settings-cwd");
       }
       // Show setup wizard if onboarding not completed
       if (!settings.onboarding_completed) {
@@ -424,7 +462,20 @@
 
     // Load saved CWD and pinned folders from localStorage
     const saved = localStorage.getItem("ocv:project-cwd");
-    if (saved) projectCwd = saved;
+    if (saved) projectCwd = normalizeCwd(saved) || "";
+
+    // Load expanded projects from localStorage (defensive parse)
+    try {
+      const rawExpanded = localStorage.getItem("ocv:expanded-projects");
+      if (rawExpanded) {
+        const parsed = JSON.parse(rawExpanded);
+        if (Array.isArray(parsed) && parsed.every((v: unknown) => typeof v === "string")) {
+          expandedProjects = new Set(parsed as string[]);
+        }
+      }
+    } catch {
+      /* ignore corrupted data, keep empty Set */
+    }
     try {
       const pinned = localStorage.getItem("ocv:pinned-cwds");
       if (pinned) pinnedCwds = JSON.parse(pinned);
@@ -547,14 +598,14 @@
 
     // Memory page signals a file was saved (refresh candidates to update exists status)
     function onMemoryFileSaved() {
-      if (currentPath?.startsWith("/memory")) loadMemoryCandidates();
+      if (currentPath?.startsWith("/memory")) loadMemoryCandidates({ soft: true });
     }
     window.addEventListener("ocv:memory-file-saved", onMemoryFileSaved);
 
     // Sync projectCwd when chat page picks a folder via dialog
     function handleCwdChanged() {
-      const newCwd = localStorage.getItem("ocv:project-cwd");
-      if (newCwd && newCwd !== projectCwd) {
+      const newCwd = normalizeCwd(localStorage.getItem("ocv:project-cwd") ?? "") || "";
+      if (newCwd !== projectCwd) {
         projectCwd = newCwd;
       }
     }
@@ -677,55 +728,29 @@
     return url.searchParams.get("run") ?? "";
   });
 
-  // Derive project list from runs + pinned folders
-  // Runs with empty or "/" cwd are "unscoped" — folded into "All Projects"
-  // Pinned folders (from "Open folder..." or previous selections) always appear
-  let projects = $derived.by(() => {
-    const cwdMap = new Map<string, { count: number; latestAt: string }>();
-    for (const run of runs) {
-      const cwd = run.cwd || "";
-      if (!cwd || cwd === "/") continue;
-      const existing = cwdMap.get(cwd);
-      if (!existing || run.started_at > existing.latestAt) {
-        cwdMap.set(cwd, { count: (existing?.count ?? 0) + 1, latestAt: run.started_at });
-      } else {
-        cwdMap.set(cwd, { ...existing, count: existing.count + 1 });
-      }
-    }
-    // Include pinned cwds not already present from runs
-    for (const cwd of pinnedCwds) {
-      if (cwd && cwd !== "/" && !cwdMap.has(cwd)) {
-        cwdMap.set(cwd, { count: 0, latestAt: "" });
-      }
-    }
-    return Array.from(cwdMap.entries())
-      .sort((a, b) => b[1].latestAt.localeCompare(a[1].latestAt))
-      .map(([cwd, info]) => ({
-        cwd,
-        label: cwdDisplayLabel(cwd),
-        runCount: info.count,
-      }));
+  // Build project folder tree for chats tab
+  let projectFolders = $derived.by(() => buildProjectFolders(runs, favoriteRunIds, pinnedCwds));
+
+  // Selectable folders: real project folders (exclude Uncategorized)
+  const selectableFolders = $derived(projectFolders.filter((f) => !f.isUncategorized));
+
+  // Debug log when folder tree rebuilds
+  $effect(() => {
+    dbg("layout", "folders rebuilt", {
+      count: projectFolders.length,
+      total: projectFolders.reduce((s, f) => s + f.conversationCount, 0),
+    });
   });
 
-  // Filter runs by selected project cwd + text search
-  let filteredRuns = $derived.by(() => {
-    let result = projectCwd ? runs.filter((r) => r.cwd === projectCwd) : runs;
-    if (runSearchQuery.trim()) {
-      const q = runSearchQuery.trim().toLowerCase();
-      result = result.filter(
-        (r) =>
-          r.prompt.toLowerCase().includes(q) ||
-          (r.name && r.name.toLowerCase().includes(q)) ||
-          r.agent.toLowerCase().includes(q) ||
-          r.status.toLowerCase().includes(q),
-      );
+  // Defensive fallback: reset projectCwd if it's no longer in selectable folders
+  $effect(() => {
+    if (!projectCwd) return; // "" is always valid (All Projects)
+    const validCwds = new Set(selectableFolders.map((f) => f.cwd));
+    if (!validCwds.has(projectCwd)) {
+      dbg("layout", "projectCwd not in selectable folders, resetting", { projectCwd });
+      projectCwd = "";
     }
-    return result;
   });
-
-  // Split sidebar runs into pinned (favorited) and normal
-  let pinnedRuns = $derived(filteredRuns.filter((r) => favoriteRunIds.has(r.id)));
-  let normalRuns = $derived(filteredRuns.filter((r) => !favoriteRunIds.has(r.id)));
 
   // Current page detection
   let currentPath = $derived($page.url.pathname);
@@ -762,17 +787,18 @@
     goto("/chat");
   }
 
-  function handleProjectChange(_cwd: string) {
-    runSearchQuery = "";
-    // Navigate to clean chat when switching projects (clears current run)
-    if (isChatPage) goto("/chat");
+  function toggleProject(folderKey: string) {
+    const next = new Set(expandedProjects);
+    if (next.has(folderKey)) next.delete(folderKey);
+    else next.add(folderKey);
+    expandedProjects = next;
   }
 
   async function pickFolder() {
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const selected = await open({ directory: true, title: t("layout_selectProjectFolder") });
-      if (selected) projectCwd = selected as string;
+      if (selected) projectCwd = normalizeCwd(selected as string) || "";
     } catch (e) {
       dbgWarn("layout", "failed to open folder dialog:", e);
     }
@@ -795,6 +821,56 @@
   $effect(() => {
     localStorage.setItem("ocv:theme", themeMode);
     document.documentElement.classList.toggle("dark", effectiveDark);
+  });
+
+  // Auto-expand folder containing selected run (chats tab only)
+  // Track runId + runs.length as change signals. runs.length is the most
+  // reliable: it changes on any new run (including resume into existing
+  // session where conversationCount stays the same).
+  // Don't track expandedProjects itself (otherwise collapsing re-expands).
+  let _prevAutoExpandRunId = "";
+  let _prevAutoExpandRunsLen = 0;
+  $effect(() => {
+    if (!isChatPage || panelTab !== "chats") return;
+    const runId = selectedRunId;
+    const runsLen = runs.length;
+    const runChanged = runId !== _prevAutoExpandRunId;
+    const runsChanged = runsLen !== _prevAutoExpandRunsLen;
+    if (!runChanged && !runsChanged) return; // early-return avoids tracking expandedProjects
+    _prevAutoExpandRunId = runId;
+    _prevAutoExpandRunsLen = runsLen;
+    if (!runId) return;
+    const next = autoExpandForRun(runId, projectFolders, expandedProjects);
+    if (next) {
+      dbg("layout", "auto-expand for run", { selectedRunId: runId });
+      expandedProjects = next;
+    }
+  });
+
+  // Auto-expand folder matching projectCwd (cross-tab sync)
+  let _prevAutoExpandCwd = "";
+  $effect(() => {
+    const cwd = projectCwd;
+    if (cwd === _prevAutoExpandCwd) return;
+    _prevAutoExpandCwd = cwd;
+    if (!cwd) return;
+    const folderKey = `cwd:${cwd}`;
+    const next = expandForProjectChange(folderKey, expandedProjects);
+    if (next) {
+      dbg("layout", "auto-expand for cwd change", { cwd });
+      expandedProjects = next;
+    }
+  });
+
+  // Persist expandedProjects + prune stale keys (only after first successful load)
+  $effect(() => {
+    if (!runsLoadSucceededOnce) return;
+    const validKeys = new Set(projectFolders.map((f) => f.folderKey));
+    const pruned = [...expandedProjects].filter((k) => validKeys.has(k));
+    if (pruned.length !== expandedProjects.size) {
+      expandedProjects = new Set(pruned);
+    }
+    localStorage.setItem("ocv:expanded-projects", JSON.stringify(pruned));
   });
 
   // Note: <html lang> is set by initLocale() and switchLocale() directly.
@@ -880,7 +956,7 @@
     <aside class="flex shrink-0 bg-sidebar text-sidebar-foreground transition-all duration-200">
       <!-- A. Icon Rail -->
       <div
-        class="flex w-[52px] flex-col items-center border-r border-sidebar-border bg-black/[0.03] dark:bg-black/20"
+        class="flex w-[44px] flex-col items-center border-r border-sidebar-border bg-black/[0.03] dark:bg-black/20"
       >
         <!-- Rail logo (OC) -->
         <div class="flex h-14 w-full items-center justify-center border-b border-sidebar-border">
@@ -893,7 +969,7 @@
             {@const isActive = currentPath.startsWith(item.path)}
             <a
               href={item.path}
-              class="relative flex h-auto w-11 flex-col items-center justify-center gap-0.5 rounded-md py-1 transition-colors duration-150 no-underline
+              class="relative flex h-9 w-9 items-center justify-center rounded-md transition-colors duration-150 no-underline
                 {isActive
                 ? 'bg-sidebar-accent text-sidebar-accent-foreground'
                 : 'hover:bg-sidebar-accent/50 text-sidebar-foreground'}"
@@ -972,9 +1048,7 @@
                   /><circle cx="12" cy="12" r="3" /></svg
                 >
               {/if}
-              <span class="text-[9px] leading-tight text-center truncate w-full px-0.5"
-                >{item.label()}</span
-              >
+              <span class="sr-only">{item.label()}</span>
             </a>
           {/each}
         </nav>
@@ -983,7 +1057,7 @@
         <div class="border-t border-sidebar-border py-2">
           <div class="flex items-center justify-center pb-1">
             <button
-              class="text-[8px] text-muted-foreground/50 hover:text-muted-foreground transition-colors cursor-pointer"
+              class="text-xs text-muted-foreground hover:text-muted-foreground transition-colors cursor-pointer"
               onclick={() => (showAbout = true)}
               title="About OpenCovibe">v0.1</button
             >
@@ -1085,14 +1159,9 @@
       <div class="flex w-[280px] flex-col overflow-hidden border-r border-sidebar-border">
         <!-- Panel header: Project selector + new chat -->
         <div class="flex h-14 items-center gap-1.5 border-b border-sidebar-border px-3">
-          <div class="flex-1 min-w-0">
-            <ProjectSelector
-              {projects}
-              bind:value={projectCwd}
-              onOpenFolder={pickFolder}
-              onchange={handleProjectChange}
-            />
-          </div>
+          <span class="flex-1 min-w-0 truncate text-sm font-medium text-sidebar-foreground"
+            >{pageName}</span
+          >
           <button
             class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors duration-150"
             onclick={() => (showCliBrowser = true)}
@@ -1134,7 +1203,7 @@
             {#each pluginSections as section}
               {@const isActive = pluginActiveSection === section.id}
               <button
-                class="flex w-full items-center gap-2 py-2 px-3 text-[11px] font-medium transition-colors
+                class="flex w-full items-center gap-2 py-2 px-3 text-xs font-medium transition-colors
                   {isActive
                   ? 'bg-sidebar-accent text-sidebar-foreground'
                   : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-foreground'}"
@@ -1229,14 +1298,14 @@
           <!-- Explorer tab bar: Files / Git -->
           <div class="flex shrink-0 border-b border-sidebar-border">
             <button
-              class="flex-1 py-1.5 text-[11px] font-medium text-center transition-colors
+              class="flex-1 py-1.5 text-xs font-medium text-center transition-colors
               {explorerTab === 'files'
                 ? 'text-sidebar-foreground border-b-2 border-primary'
                 : 'text-muted-foreground hover:text-sidebar-foreground'}"
               onclick={() => (explorerTab = "files")}>{t("sidebar_files")}</button
             >
             <button
-              class="relative flex-1 py-1.5 text-[11px] font-medium text-center transition-colors
+              class="relative flex-1 py-1.5 text-xs font-medium text-center transition-colors
               {explorerTab === 'git'
                 ? 'text-sidebar-foreground border-b-2 border-primary'
                 : 'text-muted-foreground hover:text-sidebar-foreground'}"
@@ -1244,11 +1313,94 @@
               >{t("sidebar_git")}
               {#if gitSummary && gitSummary.total_files > 0}
                 <span
-                  class="ml-0.5 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-blue-500/80 px-1 text-[8px] font-bold text-white"
+                  class="ml-0.5 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-blue-500/80 px-1 text-[10px] font-bold text-white"
                   >{gitSummary.total_files}</span
                 >
               {/if}
             </button>
+          </div>
+
+          <!-- Compact project picker (below tabs) -->
+          <div class="relative shrink-0 border-b border-sidebar-border">
+            <button
+              class="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs transition-colors hover:bg-sidebar-accent/50"
+              onclick={() => (explorerProjectOpen = !explorerProjectOpen)}
+            >
+              <svg
+                class="h-3.5 w-3.5 shrink-0 text-muted-foreground/70"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                ><path
+                  d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"
+                /></svg
+              >
+              <span class="min-w-0 truncate text-sidebar-foreground"
+                >{projectCwd ? cwdDisplayLabel(projectCwd) : t("sidebar_selectProjectBrowse")}</span
+              >
+              <svg
+                class="ml-auto h-3 w-3 shrink-0 text-muted-foreground/50 transition-transform {explorerProjectOpen
+                  ? 'rotate-180'
+                  : ''}"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg
+              >
+            </button>
+            {#if explorerProjectOpen}
+              <div class="border-b border-sidebar-border bg-sidebar">
+                {#each selectableFolders as folder (folder.folderKey)}
+                  <button
+                    class="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs transition-colors
+                      {folder.cwd === projectCwd
+                      ? 'bg-sidebar-accent text-sidebar-foreground'
+                      : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-foreground'}"
+                    onclick={() => {
+                      projectCwd = folder.cwd;
+                      explorerProjectOpen = false;
+                    }}
+                  >
+                    <svg
+                      class="h-3 w-3 shrink-0 text-muted-foreground/70"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      ><path
+                        d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"
+                      /></svg
+                    >
+                    <span class="min-w-0 truncate">{cwdDisplayLabel(folder.cwd)}</span>
+                  </button>
+                {/each}
+                <button
+                  class="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors"
+                  onclick={() => {
+                    pickFolder();
+                    explorerProjectOpen = false;
+                  }}
+                >
+                  <svg
+                    class="h-3 w-3 shrink-0"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg
+                  >
+                  <span>{t("project_openFolder")}</span>
+                </button>
+              </div>
+            {/if}
           </div>
 
           <!-- Explorer tab content -->
@@ -1339,7 +1491,7 @@
               <!-- Summary -->
               {#if gitSummary.total_files > 0}
                 <div
-                  class="flex items-center gap-2 px-3 py-1.5 text-[11px] text-muted-foreground border-b border-sidebar-border shrink-0"
+                  class="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground border-b border-sidebar-border shrink-0"
                 >
                   <span class="tabular-nums"
                     >{gitSummary.total_files !== 1
@@ -1394,97 +1546,77 @@
             {/if}
           {/if}
         {:else if isMemoryPage}
-          <!-- Memory file tree (replaces Chats/Teams when on /memory) -->
+          <!-- Memory file tree -->
           <div class="flex-1 overflow-y-auto py-1">
-            <!-- Project scope -->
-            {#if memoryScopeProject.length > 0}
-              <div class="flex items-center">
-                <button
-                  class="flex flex-1 items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70 hover:text-sidebar-foreground transition-colors"
-                  onclick={() => toggleMemoryScope("project")}
-                >
-                  <svg
-                    class="h-3 w-3 shrink-0 transition-transform {memoryScopeExpanded['project']
-                      ? 'rotate-90'
-                      : ''}"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg
-                  >
-                  {t("memory_tabProject")}
-                </button>
-                {#if memoryScopeProject.some((f) => !f.exists)}
-                  <button
-                    class="mr-2 flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/50 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
-                    onclick={() => {
-                      const next = !memoryShowCreate["project"];
-                      memoryShowCreate = { ...memoryShowCreate, project: next };
-                      if (next) memoryScopeExpanded = { ...memoryScopeExpanded, project: true };
-                    }}
-                    title={t("memory_createFile")}
-                    aria-label={t("memory_createFile")}
-                    aria-pressed={memoryShowCreate["project"]}
-                    type="button"
-                  >
-                    <svg
-                      class="h-3.5 w-3.5"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg
+            <!-- Project folders (accordion: only one expanded at a time) -->
+            {#each selectableFolders as folder (folder.folderKey)}
+              <ProjectFolderItem
+                {folder}
+                label={cwdDisplayLabel(folder.cwd)}
+                expanded={folder.cwd === projectCwd}
+                showCount={false}
+                onToggle={() => {
+                  projectCwd = projectCwd === folder.cwd ? "" : folder.cwd;
+                }}
+              >
+                {#if memoryLoading}
+                  <div class="flex items-center justify-center py-6">
+                    <div
+                      class="h-4 w-4 border-2 border-primary/30 border-t-primary rounded-full animate-spin"
+                    ></div>
+                  </div>
+                {:else if memoryScopeFolder.length > 0}
+                  {#each filterVisibleCandidates(memoryScopeFolder, true, memorySelectedFile) as file}
+                    <button
+                      class="flex w-full items-center gap-1.5 py-1 pl-4 pr-3 text-xs transition-colors
+                        {memorySelectedFile === file.path
+                        ? 'bg-sidebar-accent text-sidebar-foreground'
+                        : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-foreground'}"
+                      onclick={() => selectMemoryFile(file)}
+                      title={file.path}
                     >
-                  </button>
-                {/if}
-              </div>
-              {#if memoryScopeExpanded["project"]}
-                {#each filterVisibleCandidates(memoryScopeProject, memoryShowCreate["project"], memorySelectedFile) as file}
-                  <button
-                    class="flex w-full items-center gap-1.5 py-1 pl-7 pr-3 text-[11px] transition-colors
-                      {memorySelectedFile === file.path
-                      ? 'bg-sidebar-accent text-sidebar-foreground'
-                      : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-foreground'}"
-                    onclick={() => selectMemoryFile(file)}
-                    title={file.path}
-                  >
-                    <svg
-                      class="h-3 w-3 shrink-0 {file.exists
-                        ? 'text-blue-400'
-                        : 'text-muted-foreground/40'}"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      ><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path
-                        d="M14 2v4a2 2 0 0 0 2 2h4"
-                      /></svg
-                    >
-                    <span class="min-w-0 truncate">{file.label}</span>
-                    {#if !file.exists}
-                      <span class="ml-auto text-[9px] text-muted-foreground/50 shrink-0"
-                        >{t("memory_new")}</span
+                      <svg
+                        class="h-3 w-3 shrink-0 {file.scope === 'memory'
+                          ? 'text-amber-400'
+                          : file.exists
+                            ? 'text-blue-400'
+                            : 'text-muted-foreground/40'}"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        ><path
+                          d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"
+                        /><path d="M14 2v4a2 2 0 0 0 2 2h4" /></svg
                       >
-                    {/if}
-                  </button>
-                {/each}
-              {/if}
-            {/if}
-
-            <!-- Global scope -->
+                      <span class="min-w-0 truncate">{file.label}</span>
+                      {#if !file.exists}
+                        <span class="ml-auto text-[10px] text-muted-foreground shrink-0"
+                          >{t("memory_new")}</span
+                        >
+                      {/if}
+                    </button>
+                  {/each}
+                {:else}
+                  <p class="px-2 py-3 text-xs text-muted-foreground">
+                    {t("memory_noProjectFiles")}
+                  </p>
+                {/if}
+              </ProjectFolderItem>
+            {/each}
+            <!-- Global scope (same style as project folders, globe icon) -->
             {#if memoryScopeGlobal.length > 0}
-              <div class="flex items-center">
+              <div class="mb-0.5">
                 <button
-                  class="flex flex-1 items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70 hover:text-sidebar-foreground transition-colors"
+                  class="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors"
                   onclick={() => toggleMemoryScope("global")}
                 >
                   <svg
-                    class="h-3 w-3 shrink-0 transition-transform {memoryScopeExpanded['global']
+                    class="h-3 w-3 shrink-0 text-muted-foreground/60 transition-transform duration-150 {memoryScopeExpanded[
+                      'global'
+                    ]
                       ? 'rotate-90'
                       : ''}"
                     viewBox="0 0 24 24"
@@ -1492,138 +1624,90 @@
                     stroke="currentColor"
                     stroke-width="2"
                     stroke-linecap="round"
-                    stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg
+                    stroke-linejoin="round"><path d="M9 18l6-6-6-6" /></svg
                   >
-                  {t("memory_tabGlobal")}
+                  <!-- Globe icon -->
+                  <svg
+                    class="h-3.5 w-3.5 shrink-0 text-muted-foreground/70"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    ><circle cx="12" cy="12" r="10" /><path d="M2 12h20" /><path
+                      d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"
+                    /></svg
+                  >
+                  <span class="truncate">{t("memory_tabGlobal")}</span>
                 </button>
-                {#if memoryScopeGlobal.some((f) => !f.exists)}
-                  <button
-                    class="mr-2 flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/50 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
-                    onclick={() => {
-                      const next = !memoryShowCreate["global"];
-                      memoryShowCreate = { ...memoryShowCreate, global: next };
-                      if (next) memoryScopeExpanded = { ...memoryScopeExpanded, global: true };
-                    }}
-                    title={t("memory_createFile")}
-                    aria-label={t("memory_createFile")}
-                    aria-pressed={memoryShowCreate["global"]}
-                    type="button"
-                  >
-                    <svg
-                      class="h-3.5 w-3.5"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg
-                    >
-                  </button>
+                {#if memoryScopeExpanded["global"]}
+                  <div class="pl-3">
+                    {#each filterVisibleCandidates(memoryScopeGlobal, true, memorySelectedFile) as file}
+                      <button
+                        class="flex w-full items-center gap-1.5 py-1 pl-4 pr-3 text-xs transition-colors
+                          {memorySelectedFile === file.path
+                          ? 'bg-sidebar-accent text-sidebar-foreground'
+                          : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-foreground'}"
+                        onclick={() => selectMemoryFile(file)}
+                        title={file.path}
+                      >
+                        <svg
+                          class="h-3 w-3 shrink-0 {file.exists
+                            ? 'text-blue-400'
+                            : 'text-muted-foreground/40'}"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          ><path
+                            d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"
+                          /><path d="M14 2v4a2 2 0 0 0 2 2h4" /></svg
+                        >
+                        <span class="min-w-0 truncate">{file.label}</span>
+                        {#if !file.exists}
+                          <span class="ml-auto text-[10px] text-muted-foreground shrink-0"
+                            >{t("memory_new")}</span
+                          >
+                        {/if}
+                      </button>
+                    {/each}
+                  </div>
                 {/if}
               </div>
-              {#if memoryScopeExpanded["global"]}
-                {#each filterVisibleCandidates(memoryScopeGlobal, memoryShowCreate["global"], memorySelectedFile) as file}
-                  <button
-                    class="flex w-full items-center gap-1.5 py-1 pl-7 pr-3 text-[11px] transition-colors
-                      {memorySelectedFile === file.path
-                      ? 'bg-sidebar-accent text-sidebar-foreground'
-                      : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-foreground'}"
-                    onclick={() => selectMemoryFile(file)}
-                    title={file.path}
-                  >
-                    <svg
-                      class="h-3 w-3 shrink-0 {file.exists
-                        ? 'text-blue-400'
-                        : 'text-muted-foreground/40'}"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      ><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path
-                        d="M14 2v4a2 2 0 0 0 2 2h4"
-                      /></svg
-                    >
-                    <span class="min-w-0 truncate">{file.label}</span>
-                    {#if !file.exists}
-                      <span class="ml-auto text-[9px] text-muted-foreground/50 shrink-0"
-                        >{t("memory_new")}</span
-                      >
-                    {/if}
-                  </button>
-                {/each}
-              {/if}
             {/if}
 
-            <!-- Auto Memory scope -->
-            {#if memoryScopeMemory.length > 0}
-              <button
-                class="flex w-full items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70 hover:text-sidebar-foreground transition-colors"
-                onclick={() => toggleMemoryScope("memory")}
+            <!-- Open folder button -->
+            <button
+              class="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors"
+              onclick={pickFolder}
+            >
+              <svg
+                class="h-3.5 w-3.5 shrink-0"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg
               >
-                <svg
-                  class="h-3 w-3 shrink-0 transition-transform {memoryScopeExpanded['memory']
-                    ? 'rotate-90'
-                    : ''}"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg
-                >
-                {t("memory_tabMemory")}
-              </button>
-              {#if memoryScopeExpanded["memory"]}
-                {#each memoryScopeMemory as file}
-                  <button
-                    class="flex w-full items-center gap-1.5 py-1 pl-7 pr-3 text-[11px] transition-colors
-                      {memorySelectedFile === file.path
-                      ? 'bg-sidebar-accent text-sidebar-foreground'
-                      : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-foreground'}"
-                    onclick={() => selectMemoryFile(file)}
-                    title={file.path}
-                  >
-                    <svg
-                      class="h-3 w-3 shrink-0 text-amber-400"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      ><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path
-                        d="M14 2v4a2 2 0 0 0 2 2h4"
-                      /></svg
-                    >
-                    <span class="min-w-0 truncate">{file.label}</span>
-                  </button>
-                {/each}
-              {/if}
-            {/if}
-
-            <!-- Empty state -->
-            {#if memoryCandidates.length === 0}
-              <div class="flex items-center justify-center px-3 py-12">
-                <p class="text-xs text-muted-foreground text-center">
-                  {t("memory_setProjectFirst")}
-                </p>
-              </div>
-            {/if}
+              <span>+ {t("project_openFolder")}</span>
+            </button>
           </div>
         {:else}
           <!-- Tab bar -->
           <div class="flex shrink-0 border-b border-sidebar-border">
             <button
-              class="flex-1 py-1.5 text-[11px] font-medium text-center transition-colors
+              class="flex-1 py-1.5 text-xs font-medium text-center transition-colors
               {panelTab === 'chats'
                 ? 'text-sidebar-foreground border-b-2 border-primary'
                 : 'text-muted-foreground hover:text-sidebar-foreground'}"
               onclick={() => (panelTab = "chats")}>{t("sidebar_chats")}</button
             >
             <button
-              class="relative flex-1 py-1.5 text-[11px] font-medium text-center transition-colors
+              class="relative flex-1 py-1.5 text-xs font-medium text-center transition-colors
               {panelTab === 'teams'
                 ? 'text-sidebar-foreground border-b-2 border-primary'
                 : 'text-muted-foreground hover:text-sidebar-foreground'}"
@@ -1631,7 +1715,7 @@
               >{t("sidebar_teams")}
               {#if teamStore.teams.length > 0}
                 <span
-                  class="ml-0.5 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-teal-500/80 px-1 text-[8px] font-bold text-white"
+                  class="ml-0.5 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-teal-500/80 px-1 text-[10px] font-bold text-white"
                   >{teamStore.teams.length}</span
                 >
               {/if}
@@ -1650,11 +1734,11 @@
               />
               {#if runSearchQuery.trim()}
                 {#if searching}
-                  <p class="text-[10px] text-muted-foreground px-1 pt-0.5">
+                  <p class="text-xs text-muted-foreground px-1 pt-0.5">
                     {t("runs_searching")}
                   </p>
                 {:else if searchResults.length > 0}
-                  <p class="text-[10px] text-muted-foreground px-1 pt-0.5">
+                  <p class="text-xs text-muted-foreground px-1 pt-0.5">
                     {t("runs_resultsCount", { count: String(searchResults.length) })}
                   </p>
                 {/if}
@@ -1684,9 +1768,7 @@
                         <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                         {@html highlightMatch(truncate(result.matchedText, 60), runSearchQuery)}
                       </p>
-                      <div
-                        class="flex items-center gap-1 text-[10px] text-muted-foreground min-w-0"
-                      >
+                      <div class="flex items-center gap-1 text-xs text-muted-foreground min-w-0">
                         <span class="flex-1 min-w-0 truncate"
                           >{result.runName || truncate(result.runPrompt, 30)}</span
                         >
@@ -1697,42 +1779,42 @@
                 {/if}
               </div>
             {:else}
-              <!-- Run list -->
+              <!-- Project folder tree -->
               <div class="flex-1 overflow-y-auto px-2 py-1">
-                {#if pinnedRuns.length > 0}
-                  <div
-                    class="text-[10px] font-medium text-muted-foreground/60 uppercase tracking-wider px-3 pt-1 pb-0.5"
-                  >
-                    {t("sidebar_favorites")}
-                  </div>
-                  {#each pinnedRuns as run}
-                    <RunListItem
-                      {run}
-                      selected={run.id === selectedRunId}
-                      isFork={!!run.parent_run_id}
-                      favorite={true}
-                      onclick={() => goto(`/chat?run=${run.id}`)}
-                      onresume={(runId, mode) => goto(`/chat?run=${runId}&resume=${mode}`)}
-                    />
-                  {/each}
-                {/if}
-                {#each normalRuns as run}
-                  <RunListItem
-                    {run}
-                    selected={run.id === selectedRunId}
-                    isFork={!!run.parent_run_id}
-                    onclick={() => goto(`/chat?run=${run.id}`)}
-                    onresume={(runId, mode) => goto(`/chat?run=${runId}&resume=${mode}`)}
+                {#each projectFolders as folder (folder.folderKey)}
+                  <ProjectFolderItem
+                    {folder}
+                    label={folder.isUncategorized
+                      ? t("sidebar_uncategorized")
+                      : cwdDisplayLabel(folder.cwd)}
+                    expanded={expandedProjects.has(folder.folderKey)}
+                    {selectedRunId}
+                    onToggle={() => toggleProject(folder.folderKey)}
+                    onSelectConversation={(runId) => goto(`/chat?run=${runId}`)}
+                    onResume={(runId, mode) => goto(`/chat?run=${runId}&resume=${mode}`)}
                   />
                 {/each}
-                {#if filteredRuns.length === 0}
+                <!-- Open folder... -->
+                <button
+                  class="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors"
+                  onclick={pickFolder}
+                >
+                  <svg
+                    class="h-3.5 w-3.5 shrink-0"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"><path d="M12 5v14" /><path d="M5 12h14" /></svg
+                  >
+                  <span>{t("project_openFolder")}</span>
+                </button>
+
+                {#if projectFolders.length === 0}
                   <div class="flex flex-col items-center gap-2 px-3 py-6 text-center">
                     <p class="text-xs text-muted-foreground">
-                      {#if projectCwd && runs.length > 0}
-                        {t("sidebar_noConversationsProject")}
-                      {:else}
-                        {t("sidebar_noConversationsYet")}<br />{t("sidebar_startNewChat")}
-                      {/if}
+                      {t("sidebar_noConversationsYet")}<br />{t("sidebar_startNewChat")}
                     </p>
                   </div>
                 {/if}
@@ -1769,13 +1851,11 @@
                       <span class="text-[13px] font-medium min-w-0 truncate">{team.name}</span>
                     </div>
                     {#if team.description}
-                      <p class="text-[10px] text-muted-foreground truncate pl-3.5">
+                      <p class="text-xs text-muted-foreground truncate pl-3.5">
                         {team.description}
                       </p>
                     {/if}
-                    <div
-                      class="flex items-center gap-2 pl-3.5 text-[10px] text-muted-foreground/60"
-                    >
+                    <div class="flex items-center gap-2 pl-3.5 text-xs text-muted-foreground">
                       <span>{t("sidebar_members", { count: String(team.member_count) })}</span>
                       <span>{t("sidebar_tasks", { count: String(team.task_count) })}</span>
                     </div>
